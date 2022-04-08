@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+.DS_Store
+
+/raw
+/felix.R
+/analysis_cache
+/analysis_files

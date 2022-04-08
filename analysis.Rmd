@@ -1,0 +1,523 @@
+---
+title: "Analyses of the manuscript: Machine Learning Does not Outperform Logistic Regression in the Prediction of Sexual Relapse in a Sample of Individuals Convicted of Sexual Offenses"
+author: "Florian Pargent & Felix Schönbrodt"
+date: "2022-04-06"
+output: 
+    html_document:
+        theme: united
+        highlight: tango
+    toc:
+        toc_float:
+          collapsed: false
+          smooth_scroll: false
+---
+
+```{r echo=FALSE, include=FALSE}
+	knitr::opts_chunk$set(cache = FALSE, echo = FALSE)
+  library(tidyverse)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(gridExtra)
+  library(papaja)
+  library(mlr)
+  library(partykit)
+  library(iml)
+  library(gtable)
+  library(stablelearner)
+  library(DALEX)
+	source("preprocessing.R")
+	target <- "RF_Sex_FIX_5"
+	# only use observations with no missing values on all predictors
+  ids <- complete.cases(dat2[, c(target, varSet.all)])
+```
+The target variable for all analyses is *`r target`*. The absolute and relative frequencies are:
+
+```{r}
+	table(dat2[ids, target])
+	table(dat2[ids, target]) %>% prop.table %>% round(3)
+```
+
+# Descriptive Statistics
+
+
+```{r}
+desc <- dat %>% filter(ids) %>% select(Alter_Entlassung, Kontrolle_Haftdauer_in_Tagen) %>%
+  summarise(across(.fns = list(min = min, max = max, mean = mean, sd = sd), .names = "{col}.{fn}"))
+datatable(desc)
+``` 
+
+
+# Correlations between predictor variables
+
+```{r}
+c1 <- cor(dat[, varSet.all] %>% select(-Subgroup), use="p")
+
+diag(c1) <- NA
+c2 <- as.data.frame(c1)
+c2["rowid"] <- row.names(c2)
+c2.long <- gather(c2, colid, value, -rowid)
+
+c2.long[order(c2.long$value, decreasing=TRUE), ][1:20, ]
+```
+
+
+# Predictive model performance {.tabset .tabset-fade}
+
+```{r echo=FALSE, include=FALSE, warning=FALSE}
+# define tasks
+task.STATIC.sum <- makeClassifTask(id = "STATIC sum", data = dat2[ids, c(target, "STATIC_Sum_recalc")], 
+  target = target, positive=1)
+task.Stable.sum <- makeClassifTask(id = "Stable sum", data = dat2[ids, c(target, "Stable_Sum")], 
+  target = target, positive=1)
+task.SS.sum <- makeClassifTask(id = "STATIC sum + Stable sum", data = dat2[ids, c(target, "STATIC_Sum_recalc", "Stable_Sum")], 
+  target = target, positive=1)
+task.STATIC.items <- makeClassifTask(id = "STATIC items", data = dat2[ids, c(target, STATIC.items)], 
+  target = target, positive=1)
+task.Stable.items <- makeClassifTask(id = "Stable items", data = dat2[ids, c(target, Stable.items)], 
+  target = target, positive=1)
+task.SS.items <- makeClassifTask(id = "STATIC items + Stable items", data = dat2[ids, c(target, SS.items)],
+  target = target, positive=1)
+task.all <- makeClassifTask(id = "All predictors", data = dat2[ids, c(target, varSet.all)], 
+  target = target, positive=1)
+
+# hyperparameter settings (package defaults)
+#ranger
+num.trees <- 1000
+min.node.size <- 10
+#ctree 
+mincriterion <- 0.95
+minsplit <- 20
+minbucket <- 7
+testtype <- "Bonferroni"
+
+# define learners
+lrn.fl <- makeLearner("classif.featureless", predict.type = "prob")
+lrn.glm <- makeLearner("classif.logreg", predict.type = "prob")
+lrn.rf <- makeLearner("classif.ranger", predict.type = "prob", num.threads = 1, importance = "none", num.trees = num.trees, min.node.size = min.node.size)
+lrn.ctree <- makeLearner("classif.ctree", predict.type = "prob", testtype = testtype, 
+  mincriterion = mincriterion, minsplit = minsplit, minbucket = minbucket)
+
+# mlr baseline learner which makes prediction only based on the StaSta_Kat_recalc variable
+makeRLearner.classif.stasta <- function() {
+  makeRLearnerClassif(
+    cl = "classif.stasta",
+    package = "mlr",
+    par.set = makeParamSet(),
+    properties = c("twoclass", "numerics", "factors", "prob"),
+    name = "stasta",
+    short.name = "stasta",
+    note = ""
+  )
+}
+trainLearner.classif.stasta <- function (.learner, .task, .subset, .weights = NULL, ...) 
+{}
+predictLearner.classif.stasta <- function (.learner, .model, .newdata, predict.method = "plug-in", 
+    ...) 
+{
+  # predict NA if StaSta_Kat_recalc is not present in the data
+  if(is.null(.newdata$StaSta_Kat_recalc)) {
+    matrix(NA, nrow = nrow(.newdata), ncol = 2, dimnames = list(rownames(.newdata), c("0", "1")))
+  } else {
+    # predict "probabilities" based on the index: 1 -> 1/5, 2 -> 2/5, ..., 5 -> 5/5
+    preds <- sapply(.newdata$StaSta_Kat_recalc, function(x) x/5)
+    matrix(c(1 - preds, preds), ncol = 2, dimnames = list(rownames(.newdata), c("0", "1")))
+  }
+}
+registerS3method("makeRLearner", "classif.stasta", 
+  makeRLearner.classif.stasta)
+registerS3method("trainLearner", "classif.stasta", 
+  trainLearner.classif.stasta)
+registerS3method("predictLearner", "classif.stasta", 
+  predictLearner.classif.stasta)
+
+lrn.stasta <- makeLearner("classif.stasta", predict.type = "prob")
+
+# order of wrapping: "Zwiebelprinzip" last in first out; there we define first imputeHist then SMOTE, because we want to SMOTE first
+# problem: the target class is underrepresented - just 9% --> needs oversampling
+# use the SMOTE approach: https://mlr-org.github.io/mlr/articles/tutorial/devel/over_and_undersampling.html
+
+SMOTE <- FALSE
+
+if (SMOTE) {
+	sw.rate <- 9
+	
+	lrn.fl <- makeSMOTEWrapper(lrn.fl, sw.rate = sw.rate, sw.nn = 5)
+	lrn.glm <- makeSMOTEWrapper(lrn.glm, sw.rate = sw.rate, sw.nn = 5)
+	lrn.rf <- makeSMOTEWrapper(lrn.rf, sw.rate = sw.rate, sw.nn = 5)
+	lrn.ctree <- makeSMOTEWrapper(lrn.ctree, sw.rate = sw.rate, sw.nn = 5)
+	lrn.stasta <- makeSMOTEWrapper(lrn.stasta, sw.rate = sw.rate, sw.nn = 5)
+	
+}
+
+# define resampling strategy: 
+# use stratification to ensure that the same proportion of target variable cases are in each fold
+rdesc <- makeResampleDesc("Subsample", iters = 300, split = 4/5, stratify = TRUE)
+
+# define performance measures
+# Keep in mind that for all measures except auc, a threshold of prob = 0.5 is used!
+mes <- list(
+	setAggregation(mlr::auc, test.mean),
+  setAggregation(mlr::auc, test.sd),
+  setAggregation(kappa, test.mean),
+  setAggregation(acc, test.mean), 
+	setAggregation(tpr, test.mean),
+	setAggregation(tnr, test.mean),
+	setAggregation(ppv, test.mean)
+)
+
+# set seed (ensure reproducibility with old R version)
+RNGkind(sample.kind = "Rounding")
+set.seed(0xBEEF)
+
+# Run all learners on all tasks
+bmr <- benchmark(learners = list(lrn.fl, lrn.glm, lrn.rf, lrn.ctree, lrn.stasta), 
+  tasks = list(task.all, task.SS.items, task.Stable.items, task.STATIC.items, task.SS.sum, task.Stable.sum, task.STATIC.sum),
+  resamplings = rdesc, measures = mes, keep.pred = TRUE, models = FALSE)
+```
+
+# Benchmark Results (AUC mean/AUC sd)
+
+```{r, warning=FALSE, message=FALSE}
+bm_perm <- getBMRAggrPerformances(bmr, as.df = TRUE)[1:4] %>%
+  gather(key, value, auc.test.mean:auc.test.sd) %>%
+  unite("name", c("learner.id", "key")) %>%
+  spread(name, value) %>%
+  mutate_if(is.numeric, round, 2) %>%
+  unite("logreg", c("classif.logreg_auc.test.mean", "classif.logreg_auc.test.sd"), sep = "/") %>%
+  unite("ctree", c("classif.ctree_auc.test.mean", "classif.ctree_auc.test.sd"), sep = "/") %>%
+  unite("ranger", c("classif.ranger_auc.test.mean", "classif.ranger_auc.test.sd"), sep = "/") %>%
+  mutate(predictors = factor(task.id, c("All predictors", "STATIC items + Stable items", "STATIC sum + Stable sum", "STATIC items", "Stable items", "STATIC sum", "Stable sum"))) %>%
+  select(predictors, logreg, ctree, ranger) %>%
+  arrange(predictors)
+datatable(bm_perm)
+```
+
+Here, we do not look at the effect of specific predictor variables, but judge the overall predictive performance of a model, based on the AUC (mean/sd). All results are based on 300 stratified subsamples with a splitsize of 4/5. Due to the low frequency of the target category, we tried SMOTE oversampling, but it did not improve the preformance (not reported here). For the random forest, we used the *ranger* package with the following hyperparameters: num.trees = `r num.trees`, min.node.size = `r min.node.size` (default), mtry = square-root of p (default).
+
+The performance of the baseline model, which is only based on the StaSta categories (1 to 5) was AUC (mean/sd) = `r round(bmr$results[["All predictors"]]$classif.stasta$aggr[1], 2)` / `r round(bmr$results[["All predictors"]]$classif.stasta$aggr[2], 2)`.
+
+# Hypothesis tests
+
+To compare machine learning algorithms, the corrected resample t-test (nadeau & bengio, 2003) is used. Note that while more appropriate than a simple paired t-test, the corrected resample t-test uses a rough approximation for the correlation between subsamples, which can give too liberal results in some scenarios (nadeau & bengio, 2003).
+
+```{r}
+## corrected resampled t-test (nadeau & bengio, 2003)
+t.test.cor.res = function(x1, x2, n, split = 4/5) {
+  J = length(x1)
+  N_train = n * split
+  N_test = n * (1-split)
+  d = x1 - x2
+  m = mean(d)
+  v = var(d)
+  
+  t = m / sqrt(v * (1/J + N_test/N_train))
+  df = J - 1
+  
+  # two.sided p-value
+  2*pt(abs(t), df, lower.tail = FALSE)
+}
+
+df_perf <- getBMRPerformances(bmr, as.df = TRUE)[,1:4] %>% filter(learner.id != "classif.featureless") %>%
+  unite("condition", c("task.id", "learner.id"), sep = "_", remove = FALSE)
+df_perf$condition1 <- df_perf$condition
+compare_conditions <- df_perf %>% expand(condition, condition1) %>% filter(condition < condition1)
+compare_conditions$p.value <- apply(compare_conditions, 1, function(x) {
+  t.test.cor.res(df_perf[df_perf$condition == x[[1]], "auc"], df_perf[df_perf$condition == x[[2]], "auc"], 
+    n = sum(ids))})
+compare_conditions$p.value.adj.bh <- p.adjust(compare_conditions$p.value, method = "BH")
+```
+
+The two-sided p-values are reported both unadjusted and based on the Benjamini & Hochberg (1995) correction, with the test family being equal to the total number of possible pairwise comparisons between all conditions (`r sum(!is.na(compare_conditions$p.value.adj.bh))`).
+
+## Compare best condition for each algorithm
+
+```{r}
+datatable(
+  compare_conditions %>% filter(
+  condition == "All predictors_classif.ranger" & condition1 == "STATIC sum + Stable sum_classif.logreg" |
+  condition == "All predictors_classif.ranger" & condition1 == "STATIC sum_classif.ctree" |
+  condition == "All predictors_classif.ranger" & condition1 == "All predictors_classif.stasta" |
+  condition == "STATIC sum + Stable sum_classif.logreg" & condition1 == "STATIC sum_classif.ctree" |
+  condition == "All predictors_classif.stasta" & condition1 == "STATIC sum + Stable sum_classif.logreg" |
+  condition == "All predictors_classif.stasta" & condition1 == "STATIC sum_classif.ctree") %>%
+    mutate_if(is.numeric, round, 3)
+)
+```
+
+## Compare Static items + Stable items condition
+
+```{r}
+datatable(
+  compare_conditions %>% filter(
+  condition == "STATIC items + Stable items_classif.logreg" & condition1 == "STATIC items + Stable items_classif.ranger" |
+  condition == "STATIC items + Stable items_classif.ctree" & condition1 == "STATIC items + Stable items_classif.ranger" |
+  condition == "STATIC items + Stable items_classif.ctree" & condition1 == "STATIC items + Stable items_classif.logreg") %>%
+    mutate_if(is.numeric, round, 3)
+)
+```
+
+## Compare Static sum + Stable sum condition
+
+```{r}
+datatable(
+  compare_conditions %>% filter(
+  condition == "STATIC sum + Stable sum_classif.logreg" & condition1 == "STATIC sum + Stable sum_classif.ranger" |
+  condition == "STATIC sum + Stable sum_classif.ctree" & condition1 == "STATIC sum + Stable sum_classif.ranger" |
+  condition == "STATIC sum + Stable sum_classif.ctree" & condition1 == "STATIC sum + Stable sum_classif.logreg") %>%
+    mutate_if(is.numeric, round, 3)
+)
+```
+
+
+# ROC curves
+
+```{r, message=FALSE}
+# compute ROC data for the interesting tasks
+ROC.SS.sum <- generateThreshVsPerfData(bmr$results$`STATIC sum + Stable sum`[c("classif.ranger", "classif.logreg", "classif.ctree")], measures = list(fpr, tpr, mmce), aggregate = TRUE)
+ROC.SS.items <- generateThreshVsPerfData(bmr$results$`STATIC items + Stable items`[c("classif.ranger", "classif.logreg", "classif.ctree")], measures = list(fpr, tpr, mmce), aggregate = TRUE)
+# manually choose best condition for each learner based on benchmark result
+ROC.best <- generateThreshVsPerfData(list(
+  bmr$results$`All predictors`$classif.ranger,
+  bmr$results$`STATIC sum`$classif.ctree,
+  bmr$results$`STATIC sum + Stable sum`$classif.logreg,
+  bmr$results$`All predictors`$classif.stasta), measures = list(fpr, tpr, mmce), aggregate = TRUE)
+```
+
+## Best condition for each learner
+
+```{r}
+
+ggplot(ROC.best$data, aes(x = fpr, y = tpr)) + 
+  geom_path(aes(linetype = learner)) +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "solid", color = "lightgrey") +
+  scale_linetype_manual(guide = guide_legend(title = "Model (Best Predictor Set)"),
+    breaks = c("classif.ranger", "classif.logreg", "classif.ctree", "classif.stasta"), 
+    labels = c("RF (All Predictors)", "LogReg (Static-99 + Stable-2007 Sum Scores)", "CTree (Static-99 Sum Score)", "Static-Stable Risk Categories"),
+    values = c("dotdash", "dashed", "dotted", "solid")) +
+  xlab("1 - Specificity") + ylab("Sensitivity") +
+  theme_apa(box = TRUE) + theme(legend.position = c(0.72, 0.3))
+```
+
+## Static sum + Stable sum | Static items + Stable items
+
+```{r, fig.height=6, fig.width=10}
+p_sum <- ggplot(ROC.SS.sum$data, aes(x = fpr, y = tpr)) + 
+  geom_path(aes(linetype = learner)) +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "solid", color = "lightgrey") +
+  scale_linetype_manual(guide = guide_legend(title = "Static-99 Sum Score \n + Stable-2007 Sum Score"),
+    breaks = c("classif.ranger", "classif.logreg", "classif.ctree"), 
+    labels = c("RF", "LogReg", "CTree"),
+    values = c("dotdash", "dashed", "dotted", "solid")) +
+  xlab("1 - Specificity") + ylab("Sensitivity") +
+  theme_apa(box = TRUE) + theme(legend.position = c(0.72, 0.3))
+
+p_items <- ggplot(ROC.SS.items$data, aes(x = fpr, y = tpr)) + 
+  geom_path(aes(linetype = learner)) +
+  geom_abline(aes(intercept = 0, slope = 1), linetype = "solid", color = "lightgrey") +
+  scale_linetype_manual(guide = guide_legend(title = "Static-99 Items \n+ Stable-2007 Items"),
+    breaks = c("classif.ranger", "classif.logreg", "classif.ctree"), 
+    labels = c("RF", "LogReg", "CTree"),
+    values = c("dotdash", "dashed", "dotted", "solid")) +
+  xlab("1 - Specificity") + ylab("Sensitivity") +
+  theme_apa(box = TRUE) + theme(legend.position = c(0.72, 0.3))
+
+p_sum + p_items + plot_annotation(tag_levels = 'A')
+```
+
+# Final Models and Interpretable Machine Learning
+
+Interesting models to investigate further are:
+
+- RF with **All predictors**
+- RF with **Static sum + Stable sum**
+- CTree with **Static sum + Stable sum**
+- CTree with **Static items + Stable items**
+- LogReg with **Static sum + Stable sum**
+
+```{r, message=FALSE, warning=FALSE}
+set.seed(0xBEEF)
+rf.final.all <- train(setHyperPars(lrn.rf, importance = "permutation"), task.all)
+rf.final.SS.sum <- train(setHyperPars(lrn.rf, importance = "permutation"), task.SS.sum)
+# have to refit with partykit for package stablelearner and ggparty; mlr uses package party 
+
+ctree.final.SS.sum <- ctree(reformulate(termlabels = ".", response = "Relapse"), 
+  data = getTaskData(task.SS.sum) %>% 
+    rename(Relapse = RF_Sex_FIX_5, Static99_Sum_Score = STATIC_Sum_recalc, Stable2007_Sum_Score = Stable_Sum), 
+  control = ctree_control(testtype = testtype, mincriterion = mincriterion, minsplit = minsplit, minbucket = minbucket))
+ctree.final.SS.items <- ctree(reformulate(termlabels = ".", response = "Relapse"), data = getTaskData(task.SS.items) %>% 
+    rename(Relapse = RF_Sex_FIX_5), 
+  control = ctree_control(testtype = testtype, mincriterion = mincriterion, 
+    minsplit = minsplit, minbucket = minbucket))
+glm.final.SS.sum <- train(lrn.glm, task.SS.sum)
+```
+
+## Random Forest Permutation Feature Importance with All Predictors
+
+This is kept for legacy/comparison reasons. We use the DALEX approach (next section), because it provides an interpretable metric (∆AUC).
+```{r}
+imp <- getFeatureImportance(rf.final.all)$res
+imp <- as_tibble(imp)
+imp <- imp %>%
+  arrange(desc(importance)) %>%
+  mutate_if(is.numeric, round, 4) %>%
+  slice(1:12)
+datatable(imp, options = list(pageLength = 12))
+```
+
+## Random Forest Permutation Feature Importance with All Predictors: ∆AUC with DALEX
+
+```{r}
+
+# this function is needed as a wrapper
+custom_predict <- function(X.model, newdata) {
+   as.numeric(predict(X.model, newdata=newdata)$data$prob.1)
+}
+
+explainer_rf <- explain(
+  model = rf.final.all,
+  data = getTaskData(task.all) %>% select(-RF_Sex_FIX_5),
+  y = as.numeric(getTaskData(task.all)$RF_Sex_FIX_5) - 1,
+  predict_function = custom_predict,
+  label = "rf.final.all",
+  type="classification"
+  )
+
+# N=NULL: use all observations, not just a sample
+# B = number of iterations (not properly documented - see https://cran.r-project.org/web/packages/ingredients/ingredients.pdf)
+vip_rf <- model_parts(
+  explainer_rf, 
+  N=NULL, 
+  loss_function = loss_one_minus_auc,
+  type = "variable_importance",
+  B = 50)
+plot(vip_rf)
+
+vip_rf_summary <- print(vip_rf) %>% as.data.frame()
+vip_rf_summary$AUC <- 1-vip_rf_summary$mean_dropout_loss
+vip_rf_summary$Delta_AUC <- vip_rf_summary$AUC[vip_rf_summary$variable=="_full_model_"] - vip_rf_summary$AUC
+
+imp2 <- vip_rf_summary %>%
+  filter(variable != "_baseline_") %>% 
+  select(variable, Delta_AUC) %>% 
+  arrange(desc(Delta_AUC)) %>%
+  mutate_if(is.numeric, round, 4) %>%
+  slice(1:12)
+datatable(imp2, options = list(pageLength = 12))
+
+# for comparison: AUC of _full_model must be identical to the AUC computed by mlr
+pred <- predict(rf.final.all, task=task.all)
+performance(pred, measures=mlr::auc)
+```
+
+## Logistic Regression Coefficients with Static sum + Stable sum
+
+```{r}
+summary(getLearnerModel(glm.final.SS.sum))
+```
+
+## Partial Dependence + Individual Conditional Expectation Plots for RF and LogReg with Static sum + Stable sum
+
+Plots show the predicted values when one varies one predictor variable and keeps all other predictors constant. Each small line refers to a single observation for which the true values are used for the remaining predictors. The big yellow line is the average across all observations. Here we look at a prediction model with two predictors (Static sum + Stable sum) and see each variables contribution *in the context of the other*.
+
+```{r, message=FALSE, warning=FALSE}
+predictor_glm <- Predictor$new(glm.final.SS.sum, data = getTaskData(task.SS.sum), y = target)
+effect_STATIC_glm <- FeatureEffect$new(predictor_glm, "STATIC_Sum_recalc", method = "pdp+ice", grid.size = 50)
+effect_Stable_glm <- FeatureEffect$new(predictor_glm, "Stable_Sum", method = "pdp+ice", grid.size = 50)
+effect_STATIC_glm$results$.class <- factor(effect_STATIC_glm$results$.class, labels = c("X0", "LogReg"))
+effect_Stable_glm$results$.class <- factor(effect_Stable_glm$results$.class, labels = c("X0", "LogReg"))
+predictor_rf <- Predictor$new(rf.final.SS.sum, data = getTaskData(task.SS.sum), y = target)
+effect_STATIC_rf <- FeatureEffect$new(predictor_rf, "STATIC_Sum_recalc", method = "pdp+ice", grid.size = 50)
+effect_Stable_rf <- FeatureEffect$new(predictor_rf, "Stable_Sum", method = "pdp+ice", grid.size = 50)
+effect_STATIC_rf$results$.class <- factor(effect_STATIC_rf$results$.class, labels = c("X0", "RF"))
+effect_Stable_rf$results$.class <- factor(effect_Stable_rf$results$.class, labels = c("X0", "RF"))
+g1 <- ggplotGrob(plot(effect_STATIC_glm) + theme_bw() + scale_y_continuous('', breaks = c(0, 0.25, 0.5, 0.75, 1)))
+g1 <- g1[,-c(8,5)]
+g2 <- ggplotGrob(plot(effect_Stable_glm) + theme_bw() + scale_y_continuous('', breaks = c(0, 0.25, 0.5, 0.75, 1)))
+g2 <- g2[,-c(8,5)]
+g3 <- ggplotGrob(plot(effect_STATIC_rf) + theme_bw() + scale_y_continuous('', breaks = c(0, 0.25, 0.5, 0.75, 1)))
+g3 <- g3[,-c(8,5)]
+g4 <- ggplotGrob(plot(effect_Stable_rf) + theme_bw() + scale_y_continuous('', breaks = c(0, 0.25, 0.5, 0.75, 1)))
+g4 <- g4[,-c(8,5)]
+ag1 <- arrangeGrob(g1, g3, layout_matrix = cbind(1,2), bottom = "Static-99 Sum Score \n")
+ag2 <- arrangeGrob(g2, g4, layout_matrix = cbind(1,2), bottom = "Stable-2007 Sum Score \n")
+grid.arrange(ag1, ag2, nrow = 2, left = "Predicted Probability for Sexual Relapse")
+```
+
+## Plot single trees
+
+### Static sum + Stable sum
+
+```{r}
+plot(ctree.final.SS.sum)
+```
+
+### Static items + Stable items
+
+```{r}
+plot(ctree.final.SS.items)
+```
+
+# Assess stability of each tree
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+## investigate stability
+set.seed(0xBEEF)
+B <- 1000
+
+strat_bootstrap <- function(B = 500, v = 1, task) {
+  dat = getTaskData(task)
+  targ = getTaskData(task, target.extra = TRUE)$target
+  sampfun <- function(n) {
+    replicate(B, unlist(lapply(levels(targ), function(x) 
+      sample(which(targ == x), size = sum(targ == x), replace = TRUE))))
+  }
+    list(method = paste0("Stratified Bootstrap sampling with ", 
+      sprintf("%1.1f", 100 * v, 2), "% data"), sampler = sampfun)
+}
+
+stab.SS.sum <- stabletree(ctree.final.SS.sum, 
+  sampler = strat_bootstrap(B = 1000, task = task.SS.sum))
+stab.SS.items <- stabletree(ctree.final.SS.items, 
+  sampler = strat_bootstrap(B = 1000, task = task.SS.items))
+```
+
+### Stability of ctree with Static sum + Stable sum
+
+```{r}
+## variable selection statistics
+summary(stab.SS.sum)
+```
+
+```{r}
+## illustrate variable selections of replications
+str(image(stab.SS.sum))
+```
+
+The same splitting variables were only selected in `r (1000-430-1)/1000*100` percent of 1000 bootstrapped trees.
+
+```{r}
+## graphical cutpoint analysis
+plot(stab.SS.sum, select = c("Static99_Sum_Score", "Stable2007_Sum_Score"))
+```
+
+### Stability of ctree with Static items and Stable items
+
+```{r}
+## variable selection statistics
+summary(stab.SS.items)
+```
+
+```{r}
+## illustrate variable selections of replications
+str(image(stab.SS.items))
+```
+
+The same splitting variables were only selected in `r (848-808-1)/1000*100` percent of 1000 bootstrapped trees.
+
+```{r}
+## graphical cutpoint analysis
+plot(stab.SS.items, select = "Static99_Item_5")
+```
+
